@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .media import media_summary, probe_media
+from .tasks import process_source
 
 ROOT = Path(__file__).resolve().parents[2]
 MEDIA_DIR = ROOT / "media"
@@ -37,8 +38,16 @@ def create_job(request: JobRequest):
     if request.min_seconds > request.max_seconds:
         raise HTTPException(status_code=422, detail="min_seconds must not exceed max_seconds")
     job_id = str(uuid4())
-    jobs[job_id] = {"id": job_id, "status": "queued", "progress": 0, "request": request.model_dump(), "clips": [], "error": None}
-    return jobs[job_id]
+    payload = {"id": job_id, "status": "queued", "progress": 0, "request": request.model_dump(), "clips": [], "error": None}
+    jobs[job_id] = payload
+    try:
+        task = process_source.delay(request.source_url, job_id)
+        payload["task_id"] = task.id
+        payload["status"] = "submitted"
+    except Exception as exc:
+        payload["status"] = "failed"
+        payload["error"] = f"Worker unavailable: {exc}"
+    return payload
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
