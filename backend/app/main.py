@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import uuid4
 
+from celery.result import AsyncResult
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .media import media_summary, probe_media
 from .tasks import process_source
+from .worker import celery_app
 
 ROOT = Path(__file__).resolve().parents[2]
 MEDIA_DIR = ROOT / "media"
@@ -18,7 +20,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024
 ALLOWED_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
-app = FastAPI(title="ClipForge", version="0.2.0")
+app = FastAPI(title="ClipForge", version="0.2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
 
@@ -51,13 +53,24 @@ def create_job(request: JobRequest):
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
-    if job_id not in jobs:
+    payload = jobs.get(job_id)
+    if not payload:
         raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    task_id = payload.get("task_id")
+    if task_id:
+        result = AsyncResult(task_id, app=celery_app)
+        payload["worker_status"] = result.status.lower()
+        if result.ready() and result.successful():
+            payload["result"] = result.result
+            payload["progress"] = result.result.get("progress", payload["progress"]) if isinstance(result.result, dict) else payload["progress"]
+        elif result.failed():
+            payload["status"] = "failed"
+            payload["error"] = str(result.result)
+    return payload
 
 @app.get("/api/jobs")
 def list_jobs():
-    return list(jobs.values())
+    return [get_job(job_id) for job_id in jobs]
 
 @app.post("/api/media/upload", status_code=201)
 def upload_media(file: UploadFile = File(...)):
